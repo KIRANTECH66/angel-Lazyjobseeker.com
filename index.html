@@ -332,28 +332,46 @@
             border-left: 4px solid var(--success);
         }
         
-        /* Update live transcript styling for new position */
+        /* Pro version live transcript styling */
         .live-transcript {
-            background-color: rgba(255, 255, 255, 0.8);
-            padding: 0.4rem 0.6rem;
+            background-color: rgba(255, 255, 255, 0.95);
+            padding: 0.6rem 0.8rem;
             margin: 0;
             border-top: 1px solid var(--border);
-            border-left: 4px solid var(--primary);
-            font-style: italic;
-            color: var(--text-light);
-            box-shadow: var(--shadow-sm);
-            max-height: 80px;
+            border-left: 4px solid var(--success); /* Changed to green for Pro version */
+            color: var(--text);
+            box-shadow: var(--shadow);
+            max-height: 100px;
             overflow-y: auto;
-            opacity: 0.9;
-            font-size: 0.8rem;
+            opacity: 1;
+            font-size: 0.9rem;
             position: sticky;
             bottom: 3.5rem;
             z-index: 9;
+            transition: all 0.3s ease;
+            font-weight: 500;
+            display: none; /* Hide by default */
         }
         
         .live-transcript.active {
             display: block;
             animation: fadeIn 0.3s ease;
+            border-radius: var(--radius-sm);
+        }
+        
+        /* Pro badge for live transcript */
+        .live-transcript::before {
+            content: "PRO";
+            position: absolute;
+            top: 0.3rem;
+            right: 0.5rem;
+            background: linear-gradient(135deg, var(--success), #059669);
+            color: white;
+            font-size: 0.6rem;
+            padding: 0.1rem 0.3rem;
+            border-radius: 4px;
+            font-weight: bold;
+            opacity: 0.9;
         }
         
         #liveIndicator {
@@ -512,6 +530,32 @@
             100% {
                 box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
             }
+        }
+        
+        /* Pro version animations */
+        @keyframes typing {
+            0% { border-right-color: transparent; }
+            50% { border-right-color: var(--primary); }
+            100% { border-right-color: transparent; }
+        }
+        
+        .typing-animation {
+            display: inline-block;
+            border-right: 2px solid var(--primary);
+            animation: typing 1s infinite;
+            padding-right: 2px;
+        }
+        
+        @keyframes highlight-fade {
+            0% { background-color: rgba(99, 102, 241, 0.2); }
+            100% { background-color: transparent; }
+        }
+        
+        .word-highlight {
+            background-color: rgba(99, 102, 241, 0.1);
+            border-radius: 3px;
+            padding: 0 2px;
+            animation: highlight-fade 2s ease-out forwards;
         }
         
         @keyframes heartbeat {
@@ -946,12 +990,33 @@
         </div>
     </div>
 
-    <!-- OpenAI API Key Modal -->
+    <!-- OpenAI API Key Modal with Pro Features -->
     <div id="apikeyModal" class="apikey-modal hidden">
         <div class="apikey-modal-content">
-            <h3>Set OpenAI API Key</h3>
+            <h3>Settings</h3>
             <label for="openaiKeyInput">Enter your OpenAI API key below. It will be used for your requests only and never shared.</label>
             <input type="password" id="openaiKeyInput" placeholder="sk-..." autocomplete="off" />
+            
+            <!-- Pro Features Section -->
+            <div style="margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 1rem;">
+                <h4 style="margin-bottom: 0.5rem; color: var(--success); display: flex; align-items: center;">
+                    <span style="background: linear-gradient(135deg, var(--success), #059669); color: white; font-size: 0.6rem; padding: 0.1rem 0.3rem; border-radius: 4px; margin-right: 0.5rem;">PRO</span>
+                    Advanced Features
+                </h4>
+                
+                <!-- Live Transcription Toggle -->
+                <div style="display: flex; align-items: center; margin-bottom: 0.5rem;">
+                    <label class="toggle-switch compact" style="margin-right: 0.5rem;">
+                        <input type="checkbox" id="liveTranscriptionToggle" class="toggle-input" checked>
+                        <span class="toggle-label"></span>
+                    </label>
+                    <span style="font-size: 0.9rem;">Enable Live Transcription</span>
+                </div>
+                <p style="font-size: 0.8rem; color: var(--text-light); margin-bottom: 1rem;">
+                    Real-time transcription shows your speech as you talk, with automatic silence detection.
+                </p>
+            </div>
+            
             <div class="button-group">
                 <button class="cancel" id="cancelApiKeyBtn">Cancel</button>
                 <button class="save" id="saveApiKeyBtn">Save</button>
@@ -1035,8 +1100,11 @@
         let mediaRecorder = null;
         let audioChunks = [];
         let messages = [];
-        // Remove userProfileProvided state
         let statusHideTimer = null;
+        let recordingService = null;
+        let liveTranscriptionEnabled = true; // Enable live transcription by default
+        let userProfileProvided = false;
+        let apiKeyProvided = false;
 
         // Make sure appContent is hidden initially
         appContent.classList.add('hidden');
@@ -1146,60 +1214,72 @@
             try {
                 if (isProcessingToggle) return;
                 isProcessingToggle = true;
-                if (!mediaRecorder) {
-                    const initialized = await initializeRecording();
-                    if (!initialized) {
-                        isProcessingToggle = false;
-                        return;
-                    }
+                
+                // Initialize the RecordingService if needed
+                if (!recordingService) {
+                    const RecordingService = require('./recording.js');
+                    recordingService = new RecordingService();
                 }
 
                 if (!isRecording) {
-                    audioChunks = [];
-                    console.log('Starting recording');
+                    // Start recording with live transcription
+                    console.log('Starting recording with live transcription');
                     micButton.classList.add('recording');
                     micButton.innerHTML = '<i class="fas fa-microphone-slash"></i>';
                     updateStatus('Listening... Click microphone or press spacebar to stop');
                     updateLiveTranscript('Listening...'); // Show Listening... while recording
                     liveIndicator.classList.remove('hidden');
-                    mediaRecorder.ondataavailable = (event) => {
-                        if (event.data.size > 0) {
-                            audioChunks.push(event.data);
+                    liveTranscript.classList.add('active');
+                    
+                    // Start recording with callbacks for live chunks and silence detection
+                    await recordingService.start(
+                        // Callback for audio chunks
+                        (base64AudioChunk) => {
+                            if (liveTranscriptionEnabled) {
+                                // Send chunk for live transcription
+                                ipcRenderer.send('live-audio-chunk', base64AudioChunk);
+                            }
+                        },
+                        // Callback for silence detection
+                        () => {
+                            console.log('Silence detected');
+                            ipcRenderer.send('silence-detected');
                         }
-                    };
-                    mediaRecorder.onstop = async () => {
-                        // Show Pro upsell message instead of 'Transcribing...'
-                        transcriptText.innerHTML = 'For more speed and live transcription, try the <a href="https://lazyjobseeker.com/pricing" target="_blank" style="color:#6366f1;font-weight:bold;text-decoration:underline;">Pro</a> version of Angel.';
-                        liveTranscript.classList.add('active');
-                        const blob = new Blob(audioChunks, { type: 'audio/webm' });
-                        const buffer = await blob.arrayBuffer();
-                        let binary = '';
-                        const bytes = new Uint8Array(buffer);
-                        for (let i = 0; i < bytes.byteLength; i++) {
-                            binary += String.fromCharCode(bytes[i]);
-                        }
-                        const base64Audio = btoa(binary);
-                        ipcRenderer.send('audio-data', base64Audio);
-                        audioChunks = [];
-                    };
-                    mediaRecorder.start();
+                    );
+                    
                     isRecording = true;
                 } else {
+                    // Stop recording
                     console.log('Stopping recording');
                     micButton.classList.remove('recording');
                     micButton.innerHTML = '<i class="fas fa-microphone"></i>';
                     updateStatus('Processing...');
                     liveIndicator.classList.add('hidden');
+                    
                     try {
-                        mediaRecorder.stop();
-                        const tracks = mediaRecorder.stream.getTracks();
-                        tracks.forEach(track => track.stop());
+                        // Force process any remaining audio chunks
+                        if (liveTranscriptionEnabled) {
+                            await recordingService.forceProcessCurrentChunk((base64AudioChunk) => {
+                                ipcRenderer.send('live-audio-chunk', base64AudioChunk);
+                            });
+                        }
+                        
+                        // Stop recording and get the full audio data
+                        const base64Audio = await recordingService.stop();
+                        
+                        // Send the full audio for final processing
+                        if (base64Audio) {
+                            ipcRenderer.send('audio-data', base64Audio);
+                        }
+                        
+                        recordingService = null;
+                        isRecording = false;
                     } catch (error) {
-                        console.error('Error stopping MediaRecorder:', error);
+                        console.error('Error stopping recording:', error);
+                        updateStatus('Error stopping recording. Please try again.');
                     }
-                    mediaRecorder = null;
-                    isRecording = false;
                 }
+                
                 setTimeout(() => {
                     isProcessingToggle = false;
                 }, 300);
@@ -1211,7 +1291,7 @@
                 updateStatus('Error recording. Please try again.');
                 isRecording = false;
                 isProcessingToggle = false;
-                mediaRecorder = null;
+                recordingService = null;
             }
         }
         
@@ -1322,6 +1402,27 @@
                 addMessage(text, true); // Show transcript as user message
             }
         });
+        
+        // New listener for live transcription updates
+        ipcRenderer.on('live-transcript', (event, text) => {
+            if (liveTranscriptionEnabled) {
+                updateLiveTranscript(text);
+                liveTranscript.classList.add('active');
+            }
+        });
+        
+        // New listener for live transcription errors
+        ipcRenderer.on('live-transcript-error', (event, errorMessage) => {
+            console.error('Live transcription error:', errorMessage);
+        });
+        
+        // New listener for auto-stop recording on silence
+        ipcRenderer.on('auto-stop-recording', () => {
+            console.log('Auto-stopping recording due to silence');
+            if (isRecording) {
+                toggleRecording();
+            }
+        });
 
         // Handle recording started
         ipcRenderer.on('recording-started', () => {
@@ -1414,28 +1515,50 @@
         statusText.style.opacity = '1';
         statusText.style.visibility = 'visible';
 
-        // OpenAI API Key logic
+        // OpenAI API Key and Pro Features logic
         let userOpenAIKey = null;
         const openAIGear = document.getElementById('openAIGear');
         const apikeyModal = document.getElementById('apikeyModal');
         const openaiKeyInput = document.getElementById('openaiKeyInput');
         const saveApiKeyBtn = document.getElementById('saveApiKeyBtn');
         const cancelApiKeyBtn = document.getElementById('cancelApiKeyBtn');
+        const liveTranscriptionToggle = document.getElementById('liveTranscriptionToggle');
+
+        // Initialize the toggle with the current state
+        liveTranscriptionToggle.checked = liveTranscriptionEnabled;
 
         openAIGear.addEventListener('click', () => {
             apikeyModal.classList.remove('hidden');
             openaiKeyInput.value = userOpenAIKey || '';
+            liveTranscriptionToggle.checked = liveTranscriptionEnabled;
             openaiKeyInput.focus();
         });
+        
         cancelApiKeyBtn.addEventListener('click', () => {
             apikeyModal.classList.add('hidden');
         });
+        
         saveApiKeyBtn.addEventListener('click', () => {
             userOpenAIKey = openaiKeyInput.value.trim();
+            
+            // Update live transcription setting
+            liveTranscriptionEnabled = liveTranscriptionToggle.checked;
+            
+            // Update UI based on live transcription setting
+            if (liveTranscriptionEnabled) {
+                // Show the live transcript area with Pro badge
+                updateLiveTranscript('Pro live transcription ready...');
+            } else {
+                // Hide the live transcript area
+                liveTranscript.classList.remove('active');
+            }
+            
             apikeyModal.classList.add('hidden');
+            
             // Send the key to the main process
             ipcRenderer.send('set-openai-key', userOpenAIKey);
         });
+        
         // Optional: close modal on outside click
         apikeyModal.addEventListener('mousedown', (e) => {
             if (e.target === apikeyModal) apikeyModal.classList.add('hidden');

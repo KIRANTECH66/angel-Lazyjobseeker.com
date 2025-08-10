@@ -13,11 +13,20 @@ let mainWindow = null
 let recording = null
 let isRecording = false
 let currentTranscript = ''
+let liveTranscript = ''
+let partialTranscript = ''
 let answerDebounceTimer = null
 let currentUser = null
-let userResume = null; // New: Global variable to store user's resume
-// Add a variable to store the user-provided OpenAI key
+let userResume = null; // Global variable to store user's resume
+// Variable to store the user-provided OpenAI key
 let userOpenAIKey = null;
+// Variables for live transcription
+let transcriptionInProgress = false;
+let transcriptionQueue = [];
+let lastTranscriptionTime = 0;
+let transcriptionCooldown = 1000; // 1 second cooldown between transcription requests
+let silenceDetected = false;
+let autoStopTimer = null;
 
 // Define path for user profile data
 const userProfilePath = path.join(app.getPath('userData'), 'userProfile.json');
@@ -200,6 +209,136 @@ ipcMain.on('set-user-resume', (event, resume) => {
   }
 });
 
+// Handler for live audio chunks
+ipcMain.on('live-audio-chunk', async (event, base64Audio) => {
+  try {
+    if (!userOpenAIKey) {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('live-transcript', 'Please set your OpenAI API key using the gear icon.');
+      }
+      return;
+    }
+
+    // Reset auto-stop timer if it exists
+    if (autoStopTimer) {
+      clearTimeout(autoStopTimer);
+      autoStopTimer = null;
+    }
+
+    // Add to transcription queue
+    transcriptionQueue.push(base64Audio);
+    
+    // Process queue if not already processing
+    if (!transcriptionInProgress) {
+      processTranscriptionQueue();
+    }
+  } catch (error) {
+    console.error('Error processing live audio chunk:', error);
+  }
+});
+
+// Process the transcription queue
+async function processTranscriptionQueue() {
+  if (transcriptionQueue.length === 0 || transcriptionInProgress) {
+    return;
+  }
+
+  // Check cooldown
+  const now = Date.now();
+  if (now - lastTranscriptionTime < transcriptionCooldown) {
+    // Schedule processing after cooldown
+    setTimeout(processTranscriptionQueue, transcriptionCooldown - (now - lastTranscriptionTime));
+    return;
+  }
+
+  transcriptionInProgress = true;
+  lastTranscriptionTime = now;
+
+  try {
+    // Get the next chunk
+    const base64Audio = transcriptionQueue.shift();
+    
+    // Create OpenAI client with user key
+    const OpenAI = require('openai');
+    const openai = new OpenAI({
+      apiKey: userOpenAIKey,
+      maxRetries: 2,
+      timeout: 30000
+    });
+
+    const audioBuffer = Buffer.from(base64Audio, 'base64');
+    if (audioBuffer.length < 100) {
+      console.log('Audio buffer too small, skipping transcription');
+      transcriptionInProgress = false;
+      processTranscriptionQueue(); // Process next in queue
+      return;
+    }
+
+    // Write buffer to temp file and send to Whisper
+    const tmpFile = tmp.fileSync({ postfix: '.webm' });
+    fs.writeFileSync(tmpFile.name, audioBuffer);
+
+    console.log('Sending live audio chunk to Whisper API...');
+    const response = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(tmpFile.name),
+      model: "whisper-1",
+      language: "en",
+      response_format: "text"
+    });
+    
+    tmpFile.removeCallback();
+    
+    // Process the transcription result
+    const transcription = response;
+    if (transcription && transcription.trim()) {
+      // Update the partial transcript
+      partialTranscript += ' ' + transcription.trim();
+      partialTranscript = partialTranscript.trim();
+      
+      // Send the updated transcript to the renderer
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('live-transcript', partialTranscript);
+      }
+      
+      // Update the current transcript for the final answer
+      currentTranscript = partialTranscript;
+    }
+  } catch (error) {
+    console.error('Live transcription error:', error);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('live-transcript-error', error.message);
+    }
+  } finally {
+    transcriptionInProgress = false;
+    
+    // Process next item in queue if any
+    if (transcriptionQueue.length > 0) {
+      processTranscriptionQueue();
+    }
+  }
+}
+
+// Handler for silence detection
+ipcMain.on('silence-detected', (event) => {
+  console.log('Silence detected, preparing to generate answer...');
+  silenceDetected = true;
+  
+  // Set a timer to auto-stop if silence continues
+  if (!autoStopTimer) {
+    autoStopTimer = setTimeout(() => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('auto-stop-recording');
+      }
+    }, 3000); // Auto-stop after 3 seconds of silence
+  }
+  
+  // Generate answer if we have a transcript
+  if (currentTranscript && currentTranscript.trim()) {
+    generateAnswer(currentTranscript);
+  }
+});
+
+// Handler for final audio data (when recording is stopped)
 ipcMain.on('audio-data', async (event, base64Audio) => {
   try {
     if (!userOpenAIKey) {
@@ -208,6 +347,7 @@ ipcMain.on('audio-data', async (event, base64Audio) => {
       }
       return;
     }
+    
     // Use the user-provided key for all OpenAI requests
     const OpenAI = require('openai');
     const openai = new OpenAI({
@@ -215,6 +355,23 @@ ipcMain.on('audio-data', async (event, base64Audio) => {
       maxRetries: 3,
       timeout: 60000
     });
+    
+    // If we already have a good transcript from live transcription, use it
+    if (currentTranscript && currentTranscript.trim() && silenceDetected) {
+      console.log('Using existing transcript from live transcription:', currentTranscript);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('transcript', currentTranscript);
+      }
+      
+      // Generate answer if not already done
+      generateAnswer(currentTranscript);
+      
+      // Reset for next recording
+      silenceDetected = false;
+      return;
+    }
+    
+    // Otherwise, process the full audio file for better accuracy
     if (!base64Audio) {
       console.error('No audio data received');
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -222,8 +379,9 @@ ipcMain.on('audio-data', async (event, base64Audio) => {
       }
       return;
     }
+    
     const audioBuffer = Buffer.from(base64Audio, 'base64');
-    console.log('Received audio data from renderer, size:', audioBuffer.length);
+    console.log('Received full audio data from renderer, size:', audioBuffer.length);
     if (audioBuffer.length < 100) {
       console.error('Audio buffer too small, likely empty recording');
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -231,12 +389,13 @@ ipcMain.on('audio-data', async (event, base64Audio) => {
       }
       return;
     }
+    
     // Write buffer to temp file and send as stream to Whisper
     let response;
     const tmpFile = tmp.fileSync({ postfix: '.webm' });
     fs.writeFileSync(tmpFile.name, audioBuffer);
     try {
-      console.log('Sending audio to OpenAI Whisper API...');
+      console.log('Sending full audio to OpenAI Whisper API...');
       response = await openai.audio.transcriptions.create({
         file: fs.createReadStream(tmpFile.name),
         model: "whisper-1",
@@ -252,45 +411,22 @@ ipcMain.on('audio-data', async (event, base64Audio) => {
       tmpFile.removeCallback();
       return;
     }
+    
     tmpFile.removeCallback();
     const transcription = response;
-    console.log('Transcription result:', transcription);
+    console.log('Full transcription result:', transcription);
+    
     if (transcription && transcription.trim()) {
+      // Update current transcript with the full, more accurate version
+      currentTranscript = transcription.trim();
+      
       if (mainWindow && !mainWindow.isDestroyed()) {
         console.log('Sending transcript to renderer...');
-        mainWindow.webContents.send('transcript', transcription);
+        mainWindow.webContents.send('transcript', currentTranscript);
       }
-      // Now get the answer from OpenAI
-      try {
-        if (!userResume) {
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('answer', 'Please provide your resume first.');
-          }
-          return;
-        }
-        const systemPrompt = `You are in the interview and your profile is: ${userResume}\n\nSo you are getting questions from the interviewer so answer them like you are in interview. Make sure you are giving answers as per the profile given above. If any question asks, reply like a real candidate in an interview. Use very basic simple english, don\'t use perfect sentences, use normal sentences, give human type of response. If interviewer asks you to elaborate more then elaborate more, try to keep answer short as long as interviewer ask to elaborate. Also while you get a coding question make sure you give the code and explain every line side of the code by commenting, I mean every single line explain it so user can retype it in IDE or somewhere wherever interviewer asked and also it will be easy for him to explain code.`;
-        console.log('Sending transcript to OpenAI for answer...');
-        const completion = await openai.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: transcription }
-          ],
-          temperature: 0.3,
-          max_tokens: 300
-        });
-        const answer = completion.choices?.[0]?.message?.content || '';
-        console.log('OpenAI answer:', answer);
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          console.log('Sending answer to renderer...');
-          mainWindow.webContents.send('answer', answer);
-        }
-      } catch (error) {
-        console.error('OpenAI answer error:', error);
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('answer', 'Error generating answer: ' + error.message);
-        }
-      }
+      
+      // Generate answer
+      generateAnswer(currentTranscript);
     } else {
       console.log('No transcription available or empty result');
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -302,8 +438,61 @@ ipcMain.on('audio-data', async (event, base64Audio) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('transcript', `Error: ${error.message || 'Unknown error'}`);
     }
+  } finally {
+    // Reset for next recording
+    silenceDetected = false;
+    partialTranscript = '';
+    
+    // Clear auto-stop timer if it exists
+    if (autoStopTimer) {
+      clearTimeout(autoStopTimer);
+      autoStopTimer = null;
+    }
   }
 });
+
+// Function to generate answer from transcript
+async function generateAnswer(transcript) {
+  if (!transcript || !transcript.trim() || !userResume || !userOpenAIKey) {
+    return;
+  }
+  
+  try {
+    // Create OpenAI client
+    const OpenAI = require('openai');
+    const openai = new OpenAI({
+      apiKey: userOpenAIKey,
+      maxRetries: 3,
+      timeout: 60000
+    });
+    
+    const systemPrompt = `You are in the interview and your profile is: ${userResume}\n\nSo you are getting questions from the interviewer so answer them like you are in interview. Make sure you are giving answers as per the profile given above. If any question asks, reply like a real candidate in an interview. Use very basic simple english, don\'t use perfect sentences, use normal sentences, give human type of response. If interviewer asks you to elaborate more then elaborate more, try to keep answer short as long as interviewer ask to elaborate. Also while you get a coding question make sure you give the code and explain every line side of the code by commenting, I mean every single line explain it so user can retype it in IDE or somewhere wherever interviewer asked and also it will be easy for him to explain code.`;
+    
+    console.log('Sending transcript to OpenAI for answer...');
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: transcript }
+      ],
+      temperature: 0.3,
+      max_tokens: 300
+    });
+    
+    const answer = completion.choices?.[0]?.message?.content || '';
+    console.log('OpenAI answer:', answer);
+    
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      console.log('Sending answer to renderer...');
+      mainWindow.webContents.send('answer', answer);
+    }
+  } catch (error) {
+    console.error('OpenAI answer error:', error);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('answer', 'Error generating answer: ' + error.message);
+    }
+  }
+}
 
 ipcMain.on('toggle-screen-sharing-mode', (event, isScreenSharing) => {
   console.log(`Toggle screen sharing mode called with: ${isScreenSharing}`);
